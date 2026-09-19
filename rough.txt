@@ -1,0 +1,2083 @@
+# Rebuilding the LLM Kernel Optimization + Post-Training Stack
+
+## KernelBench → KernelGYM → veRL → Dr.Kernel → Our Own Extension
+
+### Goal
+
+The purpose of this project is **not initially to invent a new kernel-generation method**.
+
+The goal is to rebuild and understand, from first principles, the modern stack used to train language models to generate and optimize GPU kernels.
+
+We will progress through:
+
+```text
+PyTorch workload
+      ↓
+Kernel generation
+      ↓
+Correctness + performance evaluation
+      ↓
+Scalable GPU evaluation environment
+      ↓
+Agentic multi-turn optimization
+      ↓
+SFT
+      ↓
+RL with verifiable GPU rewards
+      ↓
+Distributed RL infrastructure
+      ↓
+Reward-hacking defenses
+      ↓
+Test-time scaling
+      ↓
+Our own extension
+```
+
+The major systems studied are:
+
+```text
+KernelBench
+    ↓
+KernelGYM
+    ↓
+veRL
+    ↓
+Dr.Kernel
+```
+
+Rather than merely cloning each repository and running provided scripts, we will first implement **small versions ourselves**.
+
+The guiding principle is:
+
+> Encounter the problem first. Then understand why the production system contains the machinery it does.
+
+---
+
+# 1. What This Project Should Teach
+
+By the end, we should understand how the following subjects connect.
+
+### GPU / kernel systems
+
+* CUDA execution model
+* Triton
+* GPU memory hierarchy
+* kernel fusion
+* launch overhead
+* memory bandwidth
+* compute throughput
+* benchmarking
+* synchronization
+* warmup
+* profiler counters
+* roofline reasoning
+* numerical correctness
+
+### LLM inference
+
+* autoregressive generation
+* logits and sampling
+* vLLM / SGLang
+* batching
+* rollout generation
+* serving models during RL
+* inference/training resource contention
+
+### Agentic AI
+
+* model → action → environment → observation
+* tool use
+* multi-turn reasoning
+* iterative refinement
+* trajectory collection
+* context management
+* test-time search
+* retry policies
+* selecting the best candidate
+
+### Post-training
+
+* supervised fine-tuning
+* reinforcement learning
+* RLVR
+* GRPO
+* RLOO
+* TRLOO
+* reward design
+* reward shaping
+* rejection sampling
+* reward hacking
+* policy mismatch
+* rollout generation
+
+### Distributed systems
+
+* workers
+* task queues
+* RPC / HTTP
+* scheduling
+* isolated execution
+* GPU resource allocation
+* concurrency
+* distributed rollout generation
+* training/inference separation
+* failure handling
+
+The important point is that these are **not five separate learning tracks**.
+
+They all become necessary because of one problem:
+
+> How do we teach a model to repeatedly produce correct GPU kernels that are faster than an existing implementation?
+
+---
+
+# 2. The Big Picture
+
+## Layer 1 — KernelBench
+
+Question:
+
+> Can an LLM replace a PyTorch implementation with a correct and faster GPU kernel?
+
+Basic loop:
+
+```text
+PyTorch reference
+       ↓
+Prompt LLM
+       ↓
+Generated Triton/CUDA
+       ↓
+Compile
+       ↓
+Correctness check
+       ↓
+Benchmark
+       ↓
+Speedup score
+```
+
+This teaches **evaluation**.
+
+---
+
+## Layer 2 — KernelGYM
+
+KernelBench evaluates kernels.
+
+Now imagine doing that tens or hundreds of thousands of times during RL.
+
+We need:
+
+```text
+model rollouts
+      ↓
+evaluation API
+      ↓
+task queue
+      ↓
+GPU workers
+      ↓
+isolated compilation/execution
+      ↓
+correctness
+      ↓
+benchmark
+      ↓
+profiling
+      ↓
+reward
+```
+
+This teaches **environment + distributed systems**.
+
+---
+
+## Layer 3 — veRL
+
+KernelGYM gives us rewards.
+
+But someone still has to:
+
+```text
+generate rollouts
+compute advantages
+manage policy/reference models
+perform training
+synchronize weights
+allocate GPUs
+run distributed workers
+```
+
+That is the role of an RL training framework such as **veRL**.
+
+This teaches **RL infrastructure**.
+
+We will not rebuild veRL.
+
+We will understand enough of it to know what happens between:
+
+```text
+prompt
+  ↓
+rollouts
+  ↓
+rewards
+  ↓
+advantages
+  ↓
+gradient update
+```
+
+---
+
+## Layer 4 — Dr.Kernel
+
+Dr.Kernel combines the pieces.
+
+Conceptually:
+
+```text
+Qwen base model
+      ↓
+SFT cold start
+      ↓
+multi-turn kernel generation
+      ↓
+KernelGYM feedback
+      ↓
+RL
+      ↓
+specialized kernel model
+```
+
+Its training recipe introduces techniques including:
+
+```text
+TRLOO
+MRS
+Mismatch correction
+Dual-clip ratio clipping
+Profiling Rewards
+Profiling Rejection Sampling
+```
+
+This teaches **actual post-training**.
+
+---
+
+# 3. Milestone 0 — Prerequisites
+
+Before reproducing anything, make sure these concepts are comfortable enough to use.
+
+Do not spend weeks studying them theoretically.
+
+Learn them as needed.
+
+### Python
+
+Need:
+
+```text
+subprocess
+multiprocessing
+asyncio basics
+HTTP requests
+JSON
+dataclasses
+PyTorch
+```
+
+### PyTorch
+
+Understand:
+
+```python
+torch.randn(...)
+torch.nn.Module
+torch.cuda.synchronize()
+torch.allclose(...)
+```
+
+and basic GPU tensor behavior.
+
+### Triton
+
+Need enough to write:
+
+* vector add
+* elementwise activation
+* reduction
+* simple matrix operation
+
+Understand:
+
+```text
+program_id
+block size
+tl.arange
+tl.load
+tl.store
+masking
+```
+
+### CUDA performance basics
+
+Know:
+
+```text
+global memory
+shared memory
+registers
+warps
+SMs
+memory bandwidth
+compute throughput
+kernel launch
+```
+
+No need to become an expert before beginning.
+
+---
+
+# 4. Milestone 1 — Build TinyKernelBench Ourselves
+
+## Objective
+
+Build a miniature version of KernelBench without reading too much of KernelBench's implementation first.
+
+We want to personally encounter the evaluation problems.
+
+---
+
+## Start with five tasks
+
+For example:
+
+```text
+1. ReLU
+2. vector addition
+3. softmax
+4. matrix multiplication
+5. fused bias + ReLU
+```
+
+Each task contains:
+
+```text
+PyTorch reference
+input generator
+candidate implementation
+correctness test
+benchmark
+```
+
+Example structure:
+
+```text
+tinykernelbench/
+
+    tasks/
+        relu.py
+        vector_add.py
+        softmax.py
+        matmul.py
+        fused_bias_relu.py
+
+    evaluator/
+        correctness.py
+        benchmark.py
+        compile.py
+
+    models/
+        generate.py
+
+    results/
+```
+
+---
+
+## Phase 1A — correctness
+
+Given:
+
+```python
+reference(x)
+candidate(x)
+```
+
+check:
+
+```text
+shape
+dtype
+numerical error
+NaN / Inf
+```
+
+Do not blindly use one tolerance.
+
+Investigate:
+
+```text
+absolute tolerance
+relative tolerance
+FP16
+BF16
+FP32
+```
+
+Create examples where an incorrect kernel passes a weak test.
+
+That is important.
+
+---
+
+## Phase 1B — timing
+
+Implement a naïve timer.
+
+Then deliberately discover why it lies.
+
+Learn:
+
+```text
+GPU operations are asynchronous
+warmup matters
+compilation must not be timed accidentally
+CUDA synchronization matters
+first execution may be different
+variance matters
+```
+
+Then build a better benchmark.
+
+Record:
+
+```text
+median
+p25
+p75
+min
+variance
+number of iterations
+```
+
+---
+
+## Phase 1C — compare against PyTorch
+
+For every candidate:
+
+```text
+candidate latency
+reference latency
+speedup
+```
+
+Define:
+
+```text
+speedup = reference_time / candidate_time
+```
+
+So:
+
+```text
+0.8x = slower
+1.0x = same
+1.5x = 50% faster
+```
+
+---
+
+## Phase 1D — use an LLM
+
+Give the PyTorch implementation to:
+
+```text
+Qwen Coder
+Claude / GPT if desired
+```
+
+Ask for Triton.
+
+Run the generated code through our evaluator.
+
+Log:
+
+```text
+model
+task
+candidate code
+compile success
+correctness
+latency
+speedup
+error
+```
+
+---
+
+## Milestone 1 success
+
+We should be able to explain:
+
+> Why is evaluating generated GPU code harder than simply calling `time.time()` and comparing outputs?
+
+Deliverable:
+
+```text
+TinyKernelBench
++
+5–10 tasks
++
+model-generated kernels
++
+evaluation report
+```
+
+---
+
+# 5. Milestone 2 — Study and Reproduce Real KernelBench
+
+Now clone and run KernelBench.
+
+The goal is no longer:
+
+> Make KernelBench run.
+
+The goal is:
+
+> Compare its design with the problems we encountered ourselves.
+
+Questions to answer:
+
+### Task representation
+
+How does it represent:
+
+```text
+Level 1
+Level 2
+Level 3
+Level 4
+```
+
+tasks?
+
+Why are different levels necessary?
+
+---
+
+### Correctness
+
+Investigate:
+
+```text
+number of correctness trials
+randomized inputs
+tolerances
+input generation
+failure handling
+```
+
+Compare against TinyKernelBench.
+
+---
+
+### Performance
+
+Understand:
+
+```text
+number of benchmark trials
+reference runtime
+candidate runtime
+fast_1
+fast_1.2
+```
+
+---
+
+### Run actual experiments
+
+Start small:
+
+```text
+5 Level-1 tasks
+5 Level-2 tasks
+```
+
+Try multiple models if practical.
+
+Record:
+
+```text
+compile rate
+correctness rate
+performance rate
+speedup distribution
+```
+
+---
+
+## Milestone 2 success
+
+We should be able to draw KernelBench from memory:
+
+```text
+task
+ ↓
+prompt
+ ↓
+model
+ ↓
+kernel
+ ↓
+build
+ ↓
+correctness
+ ↓
+performance
+ ↓
+score
+```
+
+And explain the major weaknesses of a naïve implementation.
+
+---
+
+# 6. Milestone 3 — Build TinyKernelGYM
+
+Now imagine:
+
+```text
+16 prompts
+×
+16 rollouts each
+×
+3 turns
+```
+
+Our local evaluator becomes the bottleneck.
+
+We need to turn evaluation into an **environment/service**.
+
+---
+
+## Architecture
+
+Build:
+
+```text
+             client
+
+                │
+            HTTP request
+                │
+                ▼
+
+        evaluation server
+
+                │
+             task queue
+                │
+
+        ┌───────┼───────┐
+        ▼       ▼       ▼
+
+     worker  worker  worker
+       │       │       │
+
+     GPU evaluation
+
+        └───────┼───────┘
+                ▼
+
+              result
+```
+
+Start with **one GPU and one worker**.
+
+Do not prematurely distribute across ten machines.
+
+---
+
+## API
+
+Something conceptually like:
+
+```text
+POST /evaluate
+```
+
+Request:
+
+```json
+{
+  "task_id": "relu_01",
+  "candidate": "...triton code..."
+}
+```
+
+Response:
+
+```json
+{
+  "compiled": true,
+  "correct": true,
+  "latency_us": 17.4,
+  "baseline_us": 21.8,
+  "speedup": 1.25,
+  "reward": 0.72
+}
+```
+
+---
+
+## Add isolation
+
+Generated code is untrusted.
+
+Every evaluation should run in a controlled subprocess.
+
+Learn why:
+
+```text
+kernel crash
+compiler crash
+timeout
+OOM
+illegal memory access
+infinite loop
+```
+
+should not kill the evaluation service.
+
+---
+
+## Add timeouts
+
+Candidate gets:
+
+```text
+compile timeout
+execution timeout
+total task timeout
+```
+
+---
+
+## Add concurrency
+
+Send 10 evaluations simultaneously.
+
+Observe what happens.
+
+Questions:
+
+```text
+Who owns the GPU?
+Can benchmarks overlap?
+Does concurrent execution destroy timing accuracy?
+Should correctness workers differ from benchmark workers?
+```
+
+These questions are the beginning of the KernelGYM design.
+
+---
+
+## Milestone 3 success
+
+We should understand why:
+
+> Kernel evaluation during RL is a distributed-systems problem.
+
+Deliverable:
+
+```text
+TinyKernelGYM
++
+HTTP API
++
+queue
++
+isolated worker
++
+correctness/performance reward
+```
+
+---
+
+# 7. Milestone 4 — Study Real KernelGYM
+
+Now use the actual KernelGYM implementation.
+
+Compare:
+
+```text
+our architecture
+vs
+their architecture
+```
+
+Focus on:
+
+```text
+server
+workers
+queueing
+GPU assignment
+process isolation
+profiling
+reward computation
+failure recovery
+```
+
+Do not try to understand every file.
+
+Follow **one request** from:
+
+```text
+HTTP request
+```
+
+all the way to:
+
+```text
+GPU result returned
+```
+
+Draw the path yourself.
+
+---
+
+## Reward hacking experiments
+
+Create intentionally malicious/broken candidates.
+
+Examples:
+
+```text
+return wrong output quickly
+skip computation
+hard-code a known shape
+special-case visible inputs
+create unused "fast" kernel
+```
+
+See what naive TinyKernelGYM accepts.
+
+Then determine what KernelGYM catches.
+
+This is one of the most important lessons of the project.
+
+> Models optimize the metric, not your intention.
+
+---
+
+# 8. Milestone 5 — Agentic Kernel Optimization
+
+Before training anything, build an **agent loop**.
+
+No RL yet.
+
+Use an existing model.
+
+```text
+model
+  ↓
+generate kernel
+  ↓
+KernelGYM
+  ↓
+feedback
+  ↓
+model sees feedback
+  ↓
+modify kernel
+  ↓
+KernelGYM
+  ↓
+repeat
+```
+
+Possible feedback:
+
+```text
+compiler error
+correctness error
+latency
+speedup
+profiling information
+```
+
+Store every trajectory.
+
+Example:
+
+```text
+task
+
+turn 1
+candidate
+compiler error
+
+turn 2
+candidate
+correct but slower
+
+turn 3
+candidate
+1.18x faster
+
+turn 4
+candidate
+1.36x faster
+```
+
+Now we have encountered:
+
+```text
+agentic AI
+tool use
+environment interaction
+trajectory
+multi-turn reasoning
+context
+test-time compute
+```
+
+without changing a single model weight.
+
+---
+
+## Context management
+
+Eventually trajectories become long.
+
+Experiment with:
+
+```text
+keep everything
+
+vs
+
+keep:
+- original task
+- best candidate
+- latest error
+- important profiler output
+```
+
+Measure whether the model performs differently.
+
+---
+
+# 9. Milestone 6 — Understand veRL
+
+We are **not rebuilding veRL**.
+
+Instead, create a mental model.
+
+We need to identify:
+
+```text
+policy / actor
+reference model
+rollout engine
+reward service
+advantages
+trainer
+workers
+```
+
+Simplified flow:
+
+```text
+prompt batch
+    ↓
+rollout workers
+    ↓
+model generates responses
+    ↓
+KernelGYM evaluates them
+    ↓
+rewards
+    ↓
+advantage calculation
+    ↓
+loss
+    ↓
+backpropagation
+    ↓
+updated policy
+```
+
+Understand where:
+
+```text
+vLLM / SGLang
+```
+
+fits versus:
+
+```text
+FSDP / Megatron
+```
+
+Very roughly:
+
+```text
+vLLM / SGLang
+    → generate rollouts efficiently
+
+FSDP / Megatron
+    → train model efficiently
+```
+
+---
+
+## Important question
+
+Why might rollout generation and training use different execution engines?
+
+Answer this ourselves after running the stack.
+
+---
+
+# 10. Milestone 7 — Run Dr.Kernel Inference
+
+Before training:
+
+**use the released model.**
+
+Compare:
+
+```text
+base Qwen
+vs
+Dr.Kernel
+```
+
+on the same kernel tasks.
+
+Record:
+
+```text
+compile success
+correctness
+speedup
+number of attempts
+quality of revisions
+response to compiler feedback
+response to profiler feedback
+```
+
+The purpose is to see:
+
+> What did post-training apparently change?
+
+---
+
+# 11. Milestone 8 — Reproduce SFT
+
+Now begin actual post-training.
+
+Start with a manageable model.
+
+Do not begin by trying to recreate the complete 14B training run.
+
+Debug with something smaller.
+
+---
+
+## SFT concept
+
+Dataset:
+
+```text
+task
+   ↓
+known good kernel
+```
+
+Training objective:
+
+> Increase the probability that the model produces outputs similar to successful examples.
+
+Pipeline:
+
+```text
+base Qwen
+    ↓
+kernel SFT dataset
+    ↓
+supervised fine-tuning
+    ↓
+cold-start model
+```
+
+Evaluate before vs after:
+
+```text
+compile rate
+correctness rate
+speedup
+```
+
+---
+
+## Question to answer
+
+Why is SFT useful before RL?
+
+We should observe something like:
+
+```text
+Base model:
+many malformed or useless candidates
+
+SFT model:
+more candidates at least enter the region
+where meaningful reward exists
+```
+
+That makes the later RL signal more useful.
+
+---
+
+# 12. Milestone 9 — Build Tiny RLVR Ourselves
+
+Before using the complete Dr.Kernel recipe, implement the conceptual loop.
+
+For each prompt:
+
+```text
+sample candidate A
+sample candidate B
+sample candidate C
+sample candidate D
+
+        ↓
+
+KernelGYM
+
+        ↓
+
+A = 0.0
+B = 0.2
+C = 0.8
+D = 0.1
+```
+
+Then update the model so higher-reward behavior becomes more likely.
+
+We do not need to invent an RL algorithm.
+
+The goal is to understand:
+
+```text
+rollout
+reward
+advantage
+policy update
+```
+
+---
+
+# 13. Milestone 10 — GRPO / RLOO / TRLOO
+
+Only now should these acronyms matter.
+
+They are different answers to:
+
+> Given sampled outputs and rewards, how should we estimate which behavior deserves to be reinforced?
+
+Do not think:
+
+```text
+PPO → GRPO → RLOO → TRLOO
+```
+
+as sequential upgrades.
+
+They are alternative methods.
+
+---
+
+## GRPO
+
+Generate a group:
+
+```text
+A
+B
+C
+D
+```
+
+compare rewards within the group.
+
+Higher-performing responses are reinforced relative to lower-performing ones.
+
+---
+
+## RLOO
+
+Uses leave-one-out reward baselines.
+
+Again, same broad problem:
+
+```text
+How good was this sample relative to an appropriate baseline?
+```
+
+---
+
+## TRLOO
+
+Dr.Kernel's multi-turn variant.
+
+The important problem is:
+
+```text
+turn 1
+  ↓
+turn 2
+  ↓
+turn 3
+```
+
+Rewards and decisions are related across a trajectory.
+
+Naive group-relative calculations can create biased signals when the same trajectory influences its own baseline.
+
+TRLOO addresses that multi-turn setting.
+
+We should first understand **the problem**, then study the equation.
+
+---
+
+# 14. Milestone 11 — Reproduce the Dr.Kernel Training Recipe
+
+Now reproduce progressively.
+
+Do not enable everything at once.
+
+---
+
+## Experiment A
+
+```text
+SFT only
+```
+
+Baseline.
+
+---
+
+## Experiment B
+
+```text
+SFT
++
+basic RL
+```
+
+Observe.
+
+---
+
+## Experiment C
+
+```text
+SFT
++
+GRPO or RLOO
++
+multi-turn
+```
+
+Observe instability/failure cases.
+
+---
+
+## Experiment D
+
+```text
+TRLOO
+```
+
+Compare.
+
+---
+
+## Experiment E — MRS
+
+Multi-turn Rejection Sampling.
+
+Investigate what happens when low-quality trajectories are allowed into training.
+
+Then enable rejection filtering.
+
+---
+
+## Experiment F — Profiling Rewards
+
+Instead of:
+
+```text
+correct = 1
+wrong = 0
+```
+
+or only final speedup,
+
+include richer profiling signals.
+
+Study whether this creates denser learning signals.
+
+---
+
+## Experiment G — PRS
+
+Profiling-based Rejection Sampling.
+
+Use profiling information to reject candidates/trajectories that look like:
+
+```text
+trivial optimization
+fake improvement
+lack of meaningful fusion
+```
+
+---
+
+## Experiment H — reward hacking
+
+Try to reproduce reward exploitation.
+
+Document:
+
+```text
+what the model did
+why evaluator accepted it
+what check catches it
+```
+
+This is a major deliverable.
+
+---
+
+# 15. Milestone 12 — Sequential Test-Time Scaling
+
+Now stop training.
+
+Take a trained model and give it more inference-time attempts.
+
+Compare:
+
+```text
+1 attempt
+
+vs
+
+3 turns
+
+vs
+
+5 turns
+
+vs
+
+5 turns × multiple iterations
+```
+
+This answers:
+
+> How much performance improvement comes from better weights versus simply spending more compute searching?
+
+Study selection:
+
+```text
+latest candidate
+best reward
+best speedup
+```
+
+Study context management.
+
+---
+
+# 16. Milestone 13 — Compare the Full Stack
+
+Create one benchmark table.
+
+Models might include:
+
+```text
+Base Qwen
+SFT Qwen
+SFT + RL
+Dr.Kernel released checkpoint
+larger open coder model
+frontier API model if budget allows
+```
+
+Metrics:
+
+```text
+compile rate
+correctness rate
+fast_1
+fast_1.2
+median speedup
+best speedup
+time to first correct kernel
+time to best kernel
+number of environment calls
+GPU evaluation cost
+model inference cost
+```
+
+Also report:
+
+```text
+single-turn
+multi-turn
+test-time scaling
+```
+
+---
+
+# 17. What NOT to Do
+
+Do not optimize the project for:
+
+```text
+"how many technologies can I put on my resume?"
+```
+
+Do not build:
+
+```text
+CUDA
+Triton
+Ray
+Redis
+Docker
+Kubernetes
+GRPO
+Kafka
+```
+
+just because the words look impressive.
+
+Every dependency must solve a problem we personally encountered.
+
+---
+
+## Do not train giant models immediately
+
+First prove the pipeline with something small.
+
+Bad approach:
+
+```text
+Rent 8 H100s
+run unknown script
+wait
+```
+
+Good approach:
+
+```text
+tiny problem
+tiny dataset
+small model
+few rollouts
+understand everything
+then scale
+```
+
+---
+
+## Do not rebuild veRL
+
+Understand it.
+
+Modify it if necessary.
+
+Do not spend three months implementing a distributed RL framework from scratch.
+
+---
+
+## Do not claim novelty during replication
+
+Milestones 1–12 are primarily:
+
+```text
+learning
+replication
+measurement
+understanding
+```
+
+Novelty comes later.
+
+---
+
+# 18. Approximate 90-Day Roadmap
+
+This is intentionally approximate.
+
+Depth matters more than hitting an arbitrary date.
+
+---
+
+## Weeks 1–2
+
+### TinyKernelBench
+
+Build:
+
+```text
+5–10 tasks
+correctness checker
+benchmarking
+LLM generation
+result logging
+```
+
+Learn:
+
+```text
+Triton
+CUDA timing
+kernel correctness
+benchmark methodology
+```
+
+Deliverable:
+
+```text
+mini benchmark report
+```
+
+---
+
+## Week 3
+
+### Real KernelBench
+
+Run official benchmark.
+
+Trace code.
+
+Compare against our version.
+
+Use several Level-1/Level-2 tasks.
+
+Deliverable:
+
+```text
+KernelBench architecture notes
++
+baseline model results
+```
+
+---
+
+## Week 4
+
+### TinyKernelGYM
+
+Build:
+
+```text
+evaluation API
+queue
+worker
+subprocess isolation
+timeouts
+reward result
+```
+
+Deliverable:
+
+```text
+working environment server
+```
+
+---
+
+## Week 5
+
+### Real KernelGYM
+
+Run real environment.
+
+Trace one request end-to-end.
+
+Test reward-hacking cases.
+
+Deliverable:
+
+```text
+architecture diagram
++
+comparison against our implementation
+```
+
+---
+
+## Week 6
+
+### Agentic kernel optimizer
+
+Build:
+
+```text
+LLM
+→ generate
+→ KernelGYM
+→ feedback
+→ retry
+```
+
+No training.
+
+Study trajectories and context.
+
+Deliverable:
+
+```text
+multi-turn optimization agent
+```
+
+---
+
+## Week 7
+
+### veRL fundamentals + Dr.Kernel inference
+
+Understand distributed RL flow.
+
+Run:
+
+```text
+base model
+vs
+released Dr.Kernel
+```
+
+Deliverable:
+
+```text
+comparison report
+```
+
+---
+
+## Week 8
+
+### SFT reproduction
+
+Small model first.
+
+Measure:
+
+```text
+before
+vs
+after SFT
+```
+
+Deliverable:
+
+```text
+cold-start checkpoint
++
+training curves
++
+evaluation
+```
+
+---
+
+## Weeks 9–10
+
+### RLVR reproduction
+
+Get end-to-end:
+
+```text
+model
+→ rollout
+→ KernelGYM
+→ reward
+→ policy update
+```
+
+Start simple.
+
+Then examine:
+
+```text
+GRPO
+RLOO
+TRLOO
+```
+
+Deliverable:
+
+```text
+small successful RL training run
+```
+
+---
+
+## Week 11
+
+### Dr.Kernel techniques
+
+Experiment with:
+
+```text
+MRS
+PR
+PRS
+reward hacking
+multi-turn behavior
+```
+
+Deliverable:
+
+```text
+ablation-style report
+```
+
+Even tiny experiments are useful.
+
+---
+
+## Week 12
+
+### Test-time scaling
+
+Measure:
+
+```text
+single-turn
+multi-turn
+multiple iterations
+context strategies
+```
+
+Deliverable:
+
+```text
+test-time scaling curves
+```
+
+---
+
+## Week 13
+
+### Final synthesis
+
+Write:
+
+```text
+What we reproduced
+What matched the paper/repo
+What didn't
+What was difficult
+Where compute went
+What failed
+What surprised us
+```
+
+Then identify the next problem.
+
+---
+
+# 19. The Extension Is Deliberately Undecided
+
+After replication, ask:
+
+### Evaluation problems
+
+```text
+Can the evaluator still be gamed?
+Are timings noisy?
+Are correctness checks insufficient?
+```
+
+### Systems problems
+
+```text
+Is compilation the bottleneck?
+Are GPU workers underutilized?
+Is queue scheduling poor?
+Does reward evaluation dominate RL wall-clock?
+```
+
+### RL problems
+
+```text
+Are rewards too sparse?
+Does TRLOO materially help?
+Does the model overfit visible tasks?
+Does RL improve beyond SFT?
+```
+
+### Agent problems
+
+```text
+Does context become bloated?
+Does the model repeat failed strategies?
+Can retrieved past optimizations help?
+```
+
+### Kernel problems
+
+```text
+Does optimization generalize across shapes?
+Across GPUs?
+Across Triton versions?
+Across NVIDIA generations?
+```
+
+Whichever problem hurts the most becomes our real extension.
+
+Possible directions:
+
+```text
+GPU regression CI
+cross-hardware optimization
+automatic kernel repair
+compiler regression diagnosis
+better context memory for kernel agents
+faster verifier infrastructure
+better reward-hacking defenses
+kernel optimization distillation
+specialized small kernel model
+```
+
+But we should **earn the right to choose this after replication**.
+
+---
+
+# 20. Repository Structure
+
+A possible personal repository:
+
+```text
+kernel-learning-stack/
+
+├── README.md
+│
+├── 01-tiny-kernelbench/
+│   ├── tasks/
+│   ├── evaluator/
+│   ├── models/
+│   └── results/
+│
+├── 02-kernelbench-study/
+│   ├── experiments/
+│   ├── notes/
+│   └── results/
+│
+├── 03-tiny-kernelgym/
+│   ├── server/
+│   ├── worker/
+│   ├── sandbox/
+│   └── client/
+│
+├── 04-kernelgym-study/
+│   ├── architecture.md
+│   ├── reward-hacking/
+│   └── experiments/
+│
+├── 05-agent-loop/
+│   ├── agent.py
+│   ├── context.py
+│   └── trajectories/
+│
+├── 06-verl-study/
+│   ├── architecture.md
+│   └── experiments/
+│
+├── 07-drkernel-inference/
+│
+├── 08-sft/
+│
+├── 09-rlvr/
+│
+├── 10-drkernel-reproduction/
+│
+├── 11-test-time-scaling/
+│
+└── 12-extension/
+```
+
+---
+
+# 21. Notes We Must Maintain
+
+For every milestone maintain:
+
+```text
+NOTES.md
+```
+
+with four sections.
+
+## What I thought before
+
+Example:
+
+> I thought CUDA events automatically made every benchmark reliable.
+
+## What actually happened
+
+> Compilation/warmup/cache behavior still changed results.
+
+## What I learned
+
+Explain in our own words.
+
+## What I still don't understand
+
+This may be the most important section.
+
+Example:
+
+> I still don't understand why this shape gets much lower occupancy.
+
+Those unanswered questions generate future work.
+
+---
+
+# 22. Resume Is the Output, Not the Input
+
+Do not start milestones by asking:
+
+> Will NVIDIA like this?
+
+Instead:
+
+```text
+build
+↓
+measure
+↓
+fail
+↓
+understand
+↓
+improve
+↓
+write what actually happened
+```
+
+If we complete this properly, the resume bullet will write itself.
+
+A future bullet might eventually look like:
+
+> Rebuilt an end-to-end LLM GPU-kernel optimization stack spanning correctness/performance evaluation, distributed GPU reward execution, multi-turn agentic optimization, SFT, and verifier-guided RL; reproduced KernelBench/KernelGYM/Dr.Kernel techniques and analyzed reward hacking, rollout throughput, and test-time scaling.
+
+But that bullet is **not the objective**.
+
+Understanding the system is.
+
+---
+
+# 23. Final Mental Model
+
+When confused, return to this:
+
+```text
+                     PYTORCH TASK
+                          │
+                          ▼
+                    LANGUAGE MODEL
+                          │
+                    writes a kernel
+                          │
+                          ▼
+                   KERNEL ENVIRONMENT
+                 /        |         \
+            compile    correct?     fast?
+                 \        |         /
+                          ▼
+                        REWARD
+                          │
+              ┌───────────┴───────────┐
+              │                       │
+        TEST-TIME AGENT            TRAINING
+              │                       │
+         try again                   veRL
+              │                       │
+         better kernel           update model
+              │                       │
+              └───────────┬───────────┘
+                          ▼
+                      better agent
+```
+
+And the technologies map cleanly:
+
+```text
+KernelBench
+    = define and evaluate the task
+
+KernelGYM
+    = make the environment scalable and trustworthy
+
+veRL
+    = run distributed RL post-training
+
+Dr.Kernel
+    = training recipe + resulting specialized model
+
+SFT
+    = imitate good examples
+
+RLVR
+    = learn from objective GPU feedback
+
+TRLOO
+    = multi-turn RL advantage estimation
+
+MRS / PR / PRS
+    = improve trajectory/reward quality
+
+Agentic AI
+    = model repeatedly acts, observes and improves
+
+Test-time scaling
+    = spend more inference compute without changing weights
+```
+
+---
+
+# Success Condition
+
+The project is successful when we can look at the actual KernelGYM/Dr.Kernel codebase and say:
+
+> I understand why this component exists, because I encountered the problem it solves.
+
+The strongest possible ending is not:
+
+> “I completed Dr.Kernel.”
+
+It is:
+
+> “After rebuilding Dr.Kernel, I found X limitation. Here is why it happens. Here is the experiment proving it. Here is the change I am now working on.”
+
+That is the transition from **learning other people's systems** to **having our own technical ideas**.
